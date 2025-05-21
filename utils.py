@@ -348,7 +348,7 @@ def pre_process_subscription(subscription, veh_id=None, distance=0.0):
         return None
     veh = {"veh_id": veh_id}
     veh["position3D"] = subscription[veh_id][57]
-    veh["velocity"] = subscription[veh_id][64]
+    veh["speed"] = subscription[veh_id][64]
     veh["position"] = subscription[veh_id][66]
     veh["heading"] = subscription[veh_id][67]
     veh["lane_index"] = subscription[veh_id][82]
@@ -370,7 +370,7 @@ def combine_vehicle_information(veh_id, velocity, position, lane_index, distance
         dict: All vehicle information.
     """
     veh = {"veh_id": veh_id}
-    veh["velocity"] = velocity
+    veh["speed"] = velocity
     veh["position"] = position
     veh["lane_index"] = lane_index
     veh["distance"] = distance
@@ -402,8 +402,11 @@ def acceleration(ego_vehicle=None, front_vehicle=None, mode=None):
         DESIRED_VELOCITY = conf.SM_IDM_DESIRED_VELOCITY
         DELTA = conf.SM_IDM_DELTA
     LENGTH = conf.LENGTH
+    # acceleration = COMFORT_ACC_MAX * \
+    #     (1 - np.power(ego_vehicle["velocity"] /
+    #                   DESIRED_VELOCITY, DELTA))
     acceleration = COMFORT_ACC_MAX * \
-        (1 - np.power(ego_vehicle["velocity"] /
+        (1 - np.power(ego_vehicle["speed"] /
                       DESIRED_VELOCITY, DELTA))
     if front_vehicle is not None:
         r = front_vehicle["position"][0] - ego_vehicle["position"][0]
@@ -432,9 +435,9 @@ def desired_gap(ego_vehicle, front_vehicle=None, mode=None):
         d0 = conf.DISTANCE_WANTED
         tau = conf.TIME_WANTED
         ab = -conf.COMFORT_ACC_MAX * conf.COMFORT_ACC_MIN
-    dv = ego_vehicle["velocity"] - front_vehicle["velocity"]
-    d_star = d0 + max(0, ego_vehicle["velocity"] * tau +
-                      ego_vehicle["velocity"] * dv / (2 * np.sqrt(ab)))
+    dv = ego_vehicle["speed"] - front_vehicle["speed"]
+    d_star = d0 + max(0, ego_vehicle["speed"] * tau +
+                      ego_vehicle["speed"] * dv / (2 * np.sqrt(ab)))
     return d_star
 
 

@@ -57,8 +57,8 @@ def run_nade_experiment(episode, experiment_path):
         track_cav=conf.simulation_config["gui_flag"],
         sublane_flag=True,
         gui_flag=conf.simulation_config["gui_flag"],
-        # output=["fcd"],
-        output=[],
+        output=["fcd"],
+        #output=[],
         experiment_path=experiment_path
     )
     sim.bind_env(env)

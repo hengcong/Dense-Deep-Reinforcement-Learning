@@ -180,3 +180,4 @@ README.pdf
 /data_analysis/behavior_policy_data
 /ray_results
 /checkpoints
+/carla_experiments

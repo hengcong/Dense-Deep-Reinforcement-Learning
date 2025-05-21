@@ -209,7 +209,6 @@ class Traj:
 
 class TreeSearchNADEBackgroundController(NADEBackgroundController):
     """Tree Search Based NADE controller
-
     Args:
         NADEBackgroundController (controller): the original rule-based controller
     """
