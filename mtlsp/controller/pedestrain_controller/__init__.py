@@ -1,1 +1,2 @@
 from .dummypedestraincontroller import DummyPedestrainController
+from .controller_carla import PedestrianController
