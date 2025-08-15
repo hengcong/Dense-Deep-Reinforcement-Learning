@@ -111,7 +111,8 @@ if __name__ == '__main__':
     subdir = 'mtlsp/pedestrian'
     model_dir = os.path.join(cwd, subdir, 'SLSTM')
     # sample_file = 'bookstore_0_0.txt'
-    sample_file = 'test.txt'        #  5 pedestrain only
+    sample_file = 'test_1.txt'        #  1 pedestrain only
+    # sample_file = 'test_5.txt'        #  5 pedestrain only
     sample_data_path = os.path.join(model_dir, sample_file)
     
     sample_data = []

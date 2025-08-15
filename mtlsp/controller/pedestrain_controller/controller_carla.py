@@ -86,7 +86,7 @@ class PedestrianController(ControllerCarla):
 
         # Update pedestrian_trajectory_raw.txt
         self.update_trajectory(predicted_traj)
-
+    
     # Process the file (sort the data, make it more readable)
     def read_and_process_trajectory(self):
         processed_info = []
