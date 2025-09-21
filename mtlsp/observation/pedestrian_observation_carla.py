@@ -2,6 +2,7 @@ from Cython.Shadow import returns
 import math
 import carla
 import os
+from mtlsp.pedestrian.ped_obs_service import Ped_Obs_Service
 
 '''
 The PedestrianObservationCarla class get all information of pedestrian in CARLA.
@@ -16,10 +17,10 @@ information: a dictionary:{
 '''
 
 class PedestrianObservationCarla():
-    def __init__(self, target_ped_id=None, time_stamp=None):
+    def __init__(self, target_ped_id=None, time_stamp=None, traj_store: Ped_Obs_Service = None):
         self.information = {}
         self.target_ped_id = target_ped_id
-        self.trajectory = []
+        self.trajectory_storage = traj_store
 
         if time_stamp ==-1:
             raise ValueError("No target pedestrian ID is provided!")
@@ -39,28 +40,7 @@ class PedestrianObservationCarla():
         self.snapshot = env.world.get_snapshot()
 
 
-        # Get the information for each pedestrian
-        ped_list = env.get_actors().filter('walker.pedestrian.*')
-        for num_ped in range(len(ped_list)):
-            ped = ped_list[num_ped]
-            obs = self._get_ped_observation(pedestrian=ped)
-            ped_id = ped.id
-
-            # Update trajectory
-            frame_id = self.snapshot.frame
-            x, y = obs['position']
-            self.trajectory.append((frame_id, ped_id, x, y))
-
-            if ped.id == self.target_ped_id:
-                self.information["Target"] = obs
-            else:
-                self.information[f"Ped_{num_ped}"] = obs
-        
-        # Save the pedestrian information
-        self.trajectory_saver()
-
-        # Clear pedestrian information in this frame
-        self.trajectory.clear()
+        # Implement build_observtion here
         
         
     def _get_ped_observation(self, pedestrian):
@@ -86,17 +66,3 @@ class PedestrianObservationCarla():
         }
     
 
-    def trajectory_saver(self):
-        '''
-        Save pedestrian trajectory to cwd/mtlsp/pedestrian/pedestrian_trajectory_raw.txt
-        '''
-        cwd = os.getcwd()
-        subdir = 'mtlsp/pedestrian'
-        save_dir = os.path.join(cwd, subdir)
-        os.makedirs(save_dir, exist_ok=True)
-        file_name = 'pedestrian_trajectory_raw.txt'
-        file_path = os.path.join(save_dir, file_name)
-
-        with open(file_path, 'a') as f:
-            for frame_id, ped_id, x, y in self.trajectory:
-                f.write(f"{frame_id} {ped_id} {x:.3f} {y:.3f}\n")

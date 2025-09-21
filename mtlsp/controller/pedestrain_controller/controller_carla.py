@@ -47,6 +47,7 @@ class PedestrianController(ControllerCarla):
         super().__init__(observation_method=observation_method, controllertype=controllertype)
 
         self.traj_data = None
+        self.pedestrian_wrapper = None
 
         # Path to pedestrian trajectory: cwd/mtlsp/pedestrian/pedestrian_trajectory_raw.txt
         cwd = os.getcwd()
@@ -61,6 +62,8 @@ class PedestrianController(ControllerCarla):
     def step(self):
         # Read and process pedestrian_trajectory_raw.txt
         self.traj_data = self.read_and_process_trajectory()
+
+
 
         # Get prediction
         predicted_traj = predict_trajectory(self.traj_data)
@@ -86,7 +89,11 @@ class PedestrianController(ControllerCarla):
 
         # Update pedestrian_trajectory_raw.txt
         self.update_trajectory(predicted_traj)
-    
+
+        # Return the control siganl to individual pedestrian
+        return control
+
+
     # Process the file (sort the data, make it more readable)
     def read_and_process_trajectory(self):
         processed_info = []
