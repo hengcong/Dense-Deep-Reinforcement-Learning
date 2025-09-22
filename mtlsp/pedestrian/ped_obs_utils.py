@@ -17,7 +17,7 @@ class RingBuffer:
     Ring Buffer: 
         Store past data for a single pedestrian
         Data structure: Double-ended queue (deque) -> One side for appending new data, the other side for popping old data
-        Data type for each entry: (timestamp, x, y) -> dimension = 3 for each row
+        Data type for each entry: (frame, x, y) -> dimension = 3 for each row
     '''
     def __init__(self, capacity: int):
         self.buffer = deque(maxlen=capacity)
