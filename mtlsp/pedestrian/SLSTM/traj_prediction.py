@@ -93,13 +93,13 @@ def predict_trajectory(past_data):
 
     # Get predicted trajectory
     last_frame = max(f for f, *_ in past_data)
-    predicted_traj = []
+    predicted_traj = defaultdict(list)
     for ped_idx, ped_id in enumerate(ped_ids):
         for t in range(pred_len):
             x, y = abs_output_seq[t, ped_idx].cpu().numpy()
             frame_id = last_frame + (t + 1) * 12
-            predicted_traj.append((frame_id, ped_id, x, y))
-    
+            predicted_traj[ped_id].append((frame_id, x, y))
+    predicted_traj = dict(predicted_traj)
     return predicted_traj
 
 
@@ -111,7 +111,8 @@ if __name__ == '__main__':
     subdir = 'mtlsp/pedestrian'
     model_dir = os.path.join(cwd, subdir, 'SLSTM')
     # sample_file = 'bookstore_0_0.txt'
-    sample_file = 'test.txt'        #  5 pedestrain only
+    sample_file = 'test_1.txt'        #  1 pedestrain only
+    # sample_file = 'test_5.txt'        #  5 pedestrain only
     sample_data_path = os.path.join(model_dir, sample_file)
     
     sample_data = []

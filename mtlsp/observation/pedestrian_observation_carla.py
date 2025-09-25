@@ -1,7 +1,6 @@
-from Cython.Shadow import returns
 import math
 import carla
-import os
+from mtlsp.pedestrian.ped_obs_utils import TrajStore
 
 '''
 The PedestrianObservationCarla class get all information of pedestrian in CARLA.
@@ -12,19 +11,22 @@ information: a dictionary:{
                             'position3d': a tuple of current X, Y, Z coordinates,
                             'speed': pedestrian velocity [m/s],
                             'acceleration': pedestrian acceleration,
-                        }, ...
+                            'trajectory': a list of (frame, x, y) tuples of past trajectory,
+                            'neighbors_ids': a list of neighbor pedestrian IDs,
+                            'neighbors_trajectory': a dictionary of neighbor pedestrian trajectories {ped_id: [(frame, x, y)]}
+                        },
 '''
 
 class PedestrianObservationCarla():
-    def __init__(self, target_ped_id=None, time_stamp=None):
+    def __init__(self, target_ped_id=None, time_stamp=None, traj_store: TrajStore = None):
         self.information = {}
         self.target_ped_id = target_ped_id
-        self.trajectory = []
+        self.traj_store = traj_store
 
         if time_stamp ==-1:
             raise ValueError("No target pedestrian ID is provided!")
         self.time_stamp = time_stamp
-        self.snapshot = None
+        self.frame = None
 
 
     
@@ -34,69 +36,47 @@ class PedestrianObservationCarla():
         elif not env.world:
             raise ValueError("No world is provided!")
         
-        # Get information from current frame
-        self.time_stamp = env.world.get_snapshot().timestamp.elapsed_seconds
-        self.snapshot = env.world.get_snapshot()
-
-
-        # Get the information for each pedestrian
-        ped_list = env.get_actors().filter('walker.pedestrian.*')
-        for num_ped in range(len(ped_list)):
-            ped = ped_list[num_ped]
-            obs = self._get_ped_observation(pedestrian=ped)
-            ped_id = ped.id
-
-            # Update trajectory
-            frame_id = self.snapshot.frame
-            x, y = obs['position']
-            self.trajectory.append((frame_id, ped_id, x, y))
-
-            if ped.id == self.target_ped_id:
-                self.information["Target"] = obs
-            else:
-                self.information[f"Ped_{num_ped}"] = obs
+        snapshot = env.world.get_snapshot()
+        self.frame  = int(snapshot.frame)
+        self.time_stamp = float(snapshot.timestamp.elapsed_seconds)
         
-        # Save the pedestrian information
-        self.trajectory_saver()
+        # get information for the target pedestrian
+        self.traj_store.scan_if_needed(env)
+        self.information = self._get_ped_observation(env, self.target_ped_id)
 
-        # Clear pedestrian information in this frame
-        self.trajectory.clear()
         
-        
-    def _get_ped_observation(self, pedestrian):
+    def _get_ped_observation(self, env, ped_id):
         '''
         Get all past and current information for pedestrian
         '''
+        if ped_id is None:
+            raise ValueError("No pedestrian ID is provided!")
+
+        pedestrian = env.world.get_actor(ped_id)
         transform = pedestrian.get_transform()
         velocity = pedestrian.get_velocity()
-        acceleration = pedestrian._get_acceleration()
+        acceleration = pedestrian.get_acceleration()
     
         heading = transform.rotation.yaw
         speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
         acc = math.sqrt(acceleration.x ** 2 + acceleration.y ** 2 + acceleration.z ** 2)
 
+        obs = self.traj_store.build_observation(ped_id, relative=False)     # get the global coordinates for every neighbors (True if relative coordinates are needed)
+        ego_traj = obs["Ego Past Trajectory"]
+        neighbors_id = obs["Neighbors"]
+        neighbors_past_traj = obs["Neighbors' Past Trajectories"]   # a dictionary
+
 
         return {
-            'ped_id':pedestrian.id,
+            'ped_id':ped_id,
             'position': (transform.location.x, transform.location.y),
             'position3d': (transform.location.x, transform.location.y, transform.location.z),
             'speed': speed,
             'acceleration': acc,
             'heading': heading,
+            'trajectory': ego_traj,
+            'neighbors_ids': neighbors_id,
+            'neighbors_trajectory': neighbors_past_traj
         }
     
 
-    def trajectory_saver(self):
-        '''
-        Save pedestrian trajectory to cwd/mtlsp/pedestrian/pedestrian_trajectory_raw.txt
-        '''
-        cwd = os.getcwd()
-        subdir = 'mtlsp/pedestrian'
-        save_dir = os.path.join(cwd, subdir)
-        os.makedirs(save_dir, exist_ok=True)
-        file_name = 'pedestrian_trajectory_raw.txt'
-        file_path = os.path.join(save_dir, file_name)
-
-        with open(file_path, 'a') as f:
-            for frame_id, ped_id, x, y in self.trajectory:
-                f.write(f"{frame_id} {ped_id} {x:.3f} {y:.3f}\n")
