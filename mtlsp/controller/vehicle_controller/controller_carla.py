@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 import numpy as np
 from bidict import bidict
-from mtlsp.observation.observation_carla import ObservationCarla
 
 class Controller_Carla(ABC):
     def __init__(self, observation_method=None, controllertype="DummyController"):
@@ -44,8 +43,8 @@ class DiscreetController(Controller_Carla):
     acc_to_idx_dic = bidict()
     for m in range(num_acc): acc_to_idx_dic[list(np.linspace(acc_low, acc_high, num=num_acc))[m]] = m
 
-    def __init__(self, observation_method = ObservationCarla, controllertype="DiscreetController"):
-        super().__init__(controllertype=controllertype,observation_method=observation_method)
+    def __init__(self, observation_method = None, controllertype="DiscreetController"):
+        super().__init__(observation_method=observation_method, controllertype=controllertype)
 
     def step(self):
         """ store ego vehicle information."""

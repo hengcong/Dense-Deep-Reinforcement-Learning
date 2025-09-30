@@ -3,9 +3,9 @@ from .nddcontrollercarla import NDDController
 import utils
 from conf import conf
 
-class NADEBackgroundControllerCarla(NDDController):
-    def __init__(self):
-        super().__init__(controllertype="NADEBackgroundController")
+class NADEBackgroundController(NDDController):
+    def __init__(self, observation_method = None, env=None, controllertype="NADEBackgroundController"):
+        super().__init__(observation_method=observation_method, env= env, controllertype=controllertype)
         self.weight = None
         self.ndd_possi = None
         self.critical_possi = None

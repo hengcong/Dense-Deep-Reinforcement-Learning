@@ -19,8 +19,8 @@ class NDDController(DiscreetController):
     speed_lb = conf.v_low
     speed_ub = conf.v_high
     LANE_CHANGE_INDEX_LIST = [0, 1, 2]
-    def __init__(self, env, controllertype="NDDController"):
-        super().__init__(controllertype=controllertype)
+    def __init__(self, observation_method = None, env=None, controllertype="NDDController" ):
+        super().__init__(observation_method = observation_method, controllertype=controllertype)
         self._recent_ndd_pdf = {"time_step": None, "pdf": None}
         self.env = env
         self.NDD_flag, self.NADE_flag = True, False
@@ -35,9 +35,12 @@ class NDDController(DiscreetController):
     @property
     def ndd_pdf(self):
         current_time = self.env.world.get_snapshot().timestamp.elapsed_seconds
+
         if self._recent_ndd_pdf["time_step"] != current_time:
+            obs = self.vehicle_wrapper.observation.information
+
             self._recent_ndd_pdf = self.get_ndd_pdf(
-                obs=self.vehicle_wrapper.observation.information,
+                obs=obs
             )
             self._recent_ndd_pdf["time_step"] = current_time
         return self._recent_ndd_pdf["pdf"]
@@ -51,13 +54,20 @@ class NDDController(DiscreetController):
         return _recent_ndd_pdf
 
     @staticmethod
-    def static_get_ndd_pdf(obs: Dict = None):
+    def static_get_ndd_pdf(obs: object = None):
         _, longi_pdf = NDDController.Longitudinal_NDD(obs)
         _, _, lateral_pdf = NDDController.Lateral_NDD(obs)
         total_pdf = [lateral_pdf[0], lateral_pdf[2]] + list(lateral_pdf[1] * longi_pdf)
         return longi_pdf, lateral_pdf, total_pdf
 
     def step(self):
+        if self.vehicle_wrapper is None:
+            raise RuntimeError(f"[FATAL] Controller has no vehicle_wrapper attached.")
+        if self.vehicle_wrapper.observation is None:
+            raise RuntimeError(f"[FATAL] Vehicle {self.vehicle_wrapper.id} has no observation object.")
+        if self.vehicle_wrapper.observation.information is None:
+            raise RuntimeError(f"[FATAL] Vehicle {self.vehicle_wrapper.id} has no observation.information.")
+
         super().step()
         final_pdf = self.ndd_pdf
         if self.vehicle_wrapper.controlled_duration == 0:
@@ -118,7 +128,8 @@ class NDDController(DiscreetController):
                     obs, pdf_array)
             return acc, pdf_array
 
-    def Lateral_NDD(self, obs: Dict = None):
+    @staticmethod
+    def Lateral_NDD( obs: Dict = None):
         """
         Decide the Lateral movement
         Input: observation of surrounding vehicles
@@ -131,6 +142,11 @@ class NDDController(DiscreetController):
         except ValueError as e:
             print(f"Caught an error: {e}")
 
+        ego_info = obs["Ego"]
+        if ego_info is None:
+            raise ValueError("[ERROR] obs['Ego'] is None! Cannot compute lane_id or speed.")
+
+        lane_id, v = ego_info["lane_index"], ego_info["speed"]
         lane_id, v = obs["Ego"]["lane_index"], obs["Ego"]["speed"]
         f1, r1, f0, r0, f2, r2 = obs["Lead"], obs["Foll"], obs["LeftLead"], obs["LeftFoll"], obs["RightLead"], obs[
             "RightFoll"]
@@ -242,65 +258,49 @@ class NDDController(DiscreetController):
             return round_value, value_idx
 
     @staticmethod
-    def _LC_prob(surrounding_vehicles: tuple[dict, dict, dict], full_obs: dict):
-        """
-        Input: (veh_front, veh_adj_front, veh_adj_back)
-        output: the lane change probability and the expected lane change probability (take the ignored situation into account)
-        """
+    def _LC_prob(surrounding_vehicles, full_obs: dict):
         LC_prob, E_LC_prob = None, None
         veh_front, veh_adj_front, veh_adj_rear = surrounding_vehicles
 
         if not veh_adj_front and not veh_adj_rear:
-            # One lead LC
-            LC_prob, LC_related = NDDController._get_One_lead_LC_prob(
-                veh_front, full_obs)
+            LC_prob, LC_related = NDDController._get_One_lead_LC_prob(veh_front, full_obs)
             E_LC_prob = LC_prob
             return E_LC_prob, "One_lead", LC_related
 
         elif veh_adj_front and not veh_adj_rear:
-            # Single lane change
-            LC_prob, LC_related = NDDController._get_Single_LC_prob(
-                veh_front, veh_adj_front, full_obs)
+            LC_prob, LC_related = NDDController._get_Single_LC_prob(veh_front, veh_adj_front, full_obs)
             E_LC_prob = LC_prob
             return E_LC_prob, "SLC", LC_related
 
         elif not veh_adj_front and veh_adj_rear:
-            # One Lead prob
-            OL_LC_prob, OL_LC_related = NDDController._get_One_lead_LC_prob(
-                veh_front, full_obs)
-
-            # Cut in prob
-            CI_LC_prob, CI_LC_related = NDDController._get_Cut_in_LC_prob(
-                veh_front, veh_adj_rear, full_obs)
+            OL_LC_prob, OL_LC_related = NDDController._get_One_lead_LC_prob(veh_front, full_obs)
+            CI_LC_prob, CI_LC_related = NDDController._get_Cut_in_LC_prob(veh_front, veh_adj_rear, full_obs)
             LC_related = CI_LC_related
 
             r_adj = veh_adj_rear["distance"]
 
             if (r_adj >= conf.min_r_ignore) and (CI_LC_prob is not None) and (OL_LC_prob is not None):
                 E_LC_prob = conf.ignore_adj_veh_prob * OL_LC_prob + \
-                    (1-conf.ignore_adj_veh_prob) * CI_LC_prob
+                            (1 - conf.ignore_adj_veh_prob) * CI_LC_prob
             else:
                 E_LC_prob = CI_LC_prob
             return E_LC_prob, "Cut_in", LC_related
 
         elif veh_adj_front and veh_adj_rear:
-            # Single lane change prob
-            SLC_LC_prob, SLC_LC_related = NDDController._get_Single_LC_prob(
-                veh_front, veh_adj_front, full_obs)
-
-            # Double lane change prob
-            DLC_LC_prob, DLC_LC_related = NDDController._get_Double_LC_prob(
-                veh_adj_front, veh_adj_rear, full_obs)
+            SLC_LC_prob, SLC_LC_related = NDDController._get_Single_LC_prob(veh_front, veh_adj_front, full_obs)
+            DLC_LC_prob, DLC_LC_related = NDDController._get_Double_LC_prob(veh_adj_front, veh_adj_rear, full_obs)
             LC_related = DLC_LC_related
 
             r_adj = veh_adj_rear["distance"]
 
             if (r_adj >= conf.min_r_ignore) and (DLC_LC_prob is not None) and (SLC_LC_prob is not None):
                 E_LC_prob = conf.ignore_adj_veh_prob * SLC_LC_prob + \
-                    (1-conf.ignore_adj_veh_prob) * DLC_LC_prob
+                            (1 - conf.ignore_adj_veh_prob) * DLC_LC_prob
             else:
                 E_LC_prob = DLC_LC_prob
             return E_LC_prob, "DLC", LC_related
+
+        return None, "InvalidInput", None
 
     @staticmethod
     # @profile

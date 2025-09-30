@@ -40,7 +40,7 @@ class ObservationCarla():
             raise ValueError("No world is provided!")
 
         target_vehicle = None
-        for veh in [env.ego_vehicle] + env.vehicles:
+        for veh in [env.ego_vehicle_wrapper] + list(env.vehicle_wrapper_list.values()):
             if veh.id == self.veh_id:
                 target_vehicle = veh
                 break
@@ -49,10 +49,10 @@ class ObservationCarla():
             raise ValueError(f"Vehicle with ID {self.veh_id} not found!")
 
         self.time_stamp = env.world.get_snapshot().timestamp.elapsed_seconds
-        self.local = {self.veh_id: self._get_vehicle_observation(target_vehicle, env.world)}
+        self.local = {self.veh_id: self._get_vehicle_observation(target_vehicle.vehicle, env.world)}
         self.context = {}
 
-        self.information = self._process_observation(env, target_vehicle)
+        self.information = self._process_observation(env=env, target_vehicle=target_vehicle.vehicle)
 
     def _get_vehicle_observation(self, vehicle, world, ego_pos3d=None):
         transform = vehicle.get_transform()
@@ -103,7 +103,7 @@ class ObservationCarla():
             'prev_action': getattr(vehicle, "last_action", None),
         }
 
-    def _process_observation(self, env=None, target_vehicle=None):
+    def _process_observation(self, target_vehicle=None, env=None):
         # get surrounding vehicle information
         surrounding = env.get_surrounding_vehicles(target_vehicle)
         world = env.world

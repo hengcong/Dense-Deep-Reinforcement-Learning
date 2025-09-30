@@ -409,7 +409,11 @@ def acceleration(ego_vehicle=None, front_vehicle=None, mode=None):
         (1 - np.power(ego_vehicle["speed"] /
                       DESIRED_VELOCITY, DELTA))
     if front_vehicle is not None:
-        r = front_vehicle["position"][0] - ego_vehicle["position"][0]
+        ego_pos = np.array(ego_vehicle["position"])
+        front_pos = np.array(front_vehicle["position"])
+        r = np.linalg.norm(front_pos - ego_pos)  # Euclidean distance
+
+        # r = front_vehicle["position"][0] - ego_vehicle["position"][0]
         d = max(1e-5, r - LENGTH)
         acceleration -= COMFORT_ACC_MAX * \
             np.power(desired_gap(ego_vehicle, front_vehicle, mode) / d, 2)
@@ -435,9 +439,13 @@ def desired_gap(ego_vehicle, front_vehicle=None, mode=None):
         d0 = conf.DISTANCE_WANTED
         tau = conf.TIME_WANTED
         ab = -conf.COMFORT_ACC_MAX * conf.COMFORT_ACC_MIN
-    dv = ego_vehicle["speed"] - front_vehicle["speed"]
+    # dv = ego_vehicle["speed"] - front_vehicle["speed"]
+    dv_clip = 10  # or 5
+    dv = np.clip(ego_vehicle["speed"] - front_vehicle["speed"], -dv_clip, dv_clip)
     d_star = d0 + max(0, ego_vehicle["speed"] * tau +
                       ego_vehicle["speed"] * dv / (2 * np.sqrt(ab)))
+    #print(f"[desired_gap] v={ego_vehicle['speed']:.1f}, dv={dv:.1f}, d_star={d_star:.1f}")
+
     return d_star
 
 

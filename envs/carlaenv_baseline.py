@@ -38,42 +38,14 @@ class CarlaEnv(core.Env):
         super(CarlaEnv, self).__init__()
         #self.vehicle_wrapper_dict = None
         self.mode = mode
-        # ensure conf.experiment_config["mode"] exists BEFORE creating controllers
-        if not hasattr(conf, "experiment_config"):
-            conf.experiment_config = {}
-        conf.experiment_config.setdefault("mode", self.mode)
         self.step_size = 0.05
 
         # Connect to CARLA server
         self.client = carla.Client('localhost', 2000)
         self.client.set_timeout(10.0)  # Set the connection timeout
 
-        # Choose map robustly
-        available_maps = self.client.get_available_maps()
-        target_key = 'Town04'
-        selected_map = None
-        for m in available_maps:
-            # m examples: '/Game/Carla/Maps/Town04', '/Game/Carla/Maps/singlelane400m'
-            if target_key.lower() in m.lower():
-                selected_map = m
-                break
-
-        if selected_map is None:
-            # Fallback to a known builtin map to avoid hard crash
-            selected_map = '/Game/Carla/Maps/Town04'
-            print(f"[WARN] Map '{target_key}' not found. Falling back to {selected_map}")
-
-        self.world = self.client.load_world(selected_map)  # Load a specific town
+        self.world = self.client.load_world('singlelane400m')  # Load a specific town
         self.map = self.world.get_map()
-
-        # --- Enable synchronous mode and align timing ---
-        settings = self.world.get_settings()
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = self.step_size  # 0.05s
-        self.world.apply_settings(settings)
-
-        for _ in range(3):
-            self._tick()
 
         self.num_veh = num_veh
         self.num_ped = num_ped
@@ -239,7 +211,6 @@ class CarlaEnv(core.Env):
         self.ego_vehicle_wrapper.set_role("CAV")
 
         if self.mode == "TM":
-            self.traffic_manager.set_synchronous_mode(True)
             self.traffic_manager.set_global_distance_to_leading_vehicle(2.0)
             self.traffic_manager.ignore_lights_percentage(self.ego_vehicle, 0)
             self.traffic_manager.auto_lane_change(self.ego_vehicle, True)
@@ -249,6 +220,7 @@ class CarlaEnv(core.Env):
             self.ego_vehicle_wrapper.install_controller(self.ego_controller)
 
         elif self.mode == "NDE":
+            self.ego_vehicle_wrapper.vehicle.set_simulate_physics(False)
             self.ego_vehicle_wrapper.cached_transform = spawn_point
             speed = 15.0  # m/s
             yaw = self.ego_vehicle_wrapper.cached_transform.rotation.yaw
@@ -281,6 +253,31 @@ class CarlaEnv(core.Env):
             #self.global_controller_instance_list[self.ego_vehicle.id] = self.ego_controller #NOTE: 这有问题
 
         # self.ego_vehicle_wrapper.update_observation(self)
+    def get_spawn_position(self):
+        lane_starts = [
+            # Eastbound (+x)
+            (-0.077726349234581, -0.853381872177124, 10.169989585876465, -0.0002865120768547058),  # yaw, x, y, z
+            (-0.077726349234581, -0.8581299185752869, 6.669992446899414, -0.0002865120768547058),
+            (-0.077726349234581, -0.8628779649734497, 3.1699953079223633, -0.0002865120768547058),
+            (-0.077726349234581, -0.8676260113716125, -0.33000147342681885, -0.0002865120768547058),
+            # Westbound (-x)
+            (179.92227172851562, 500.1271667480469, -4.509644985198975, -0.2002534121274948),
+            (179.92227172851562, 500.1224365234375, -8.009641647338867, -0.2002534121274948),
+            (179.92227172851562, 500.11767578125, -11.509638786315918, -0.2002534121274948),
+            (179.92227172851562, 500.1129150390625, -15.009635925292969, -0.2002534121274948),
+        ]
+        yaw, x, y, z = random.choice(lane_starts)
+        s_offset = random.uniform(30, 80)
+        wp = self.world.get_map().get_waypoint(
+        carla.Location(x=x, y=y, z=z),
+        project_to_road=True,
+        lane_type=carla.LaneType.Driving)
+
+        spawn_pos_list = wp.next(s_offset)
+        if spawn_pos_list:
+            return spawn_pos_list[0].transform
+        else:
+            return wp.transform
 
     def spawn_background_vehicle(self, spawn_point, speed, road_id, lane_id):
         """ Generate background vehicles in CARLA"""
@@ -360,7 +357,7 @@ class CarlaEnv(core.Env):
                 # print(f"vehicle.{vehicle.id} speed:{speed}")
                 # print(f"vehicle.{vehicle.id} direction:{forward_vector}, speed:{velocity_vector}")
 
-                self._tick()
+                self.world.wait_for_tick()
 
                 #print(f"[✓] Vehicle {vehicle.id} spawned | mode={self.mode} | physics={wrapper.simulate_physics_enabled}")
 
@@ -427,8 +424,6 @@ class CarlaEnv(core.Env):
 
     def generate_bv_traffic_flow(self):
         all_spawn_lanes = [(key, sps) for key, sps in self.lane_map.items() if len(sps) > 1]
-        if not all_spawn_lanes:
-            print("[BV][WARN] lane_map has no lanes with >1 spawn points.")
         random.shuffle(all_spawn_lanes)
 
         total_needed = self.num_veh
@@ -436,7 +431,6 @@ class CarlaEnv(core.Env):
         vehicle_records = []
         ctrl_cmd_batch = []
         used_positions = set()
-        tm_port = self.traffic_manager.get_port()        # >>> TM port (hand over immediately after spawn)
 
         for (road_id, lane_id), spawn_points in all_spawn_lanes:
             if spawned >= total_needed:
@@ -447,15 +441,8 @@ class CarlaEnv(core.Env):
             previous = None
 
             for i in range(max_in_lane):
-                if spawned >= total_needed:
-                    break
-
                 sp = spawn_points[i]
                 pos = round(sp.location.x, 1)
-                # >>> use (x,y) for uniqueness
-                pos_key = (round(sp.location.x, 1), round(sp.location.y, 1))
-                if pos_key in used_positions:
-                    continue
 
                 if pos in used_positions:
                     continue
@@ -493,11 +480,12 @@ class CarlaEnv(core.Env):
                 if spawned >= total_needed:
                     break
         self.client.apply_batch(ctrl_cmd_batch)
-        self._tick()
+        self.world.wait_for_tick()
 
-        print("=== Background Vehicles ===")
-        for vid, pos, mode in vehicle_records:
-            print(f"[{mode}] Vehicle ID: {vid}, Position X: {pos:.1f}")
+
+        # print("=== Background Vehicles ===")
+        # for vid, pos, mode in vehicle_records:
+        #     print(f"[{mode}] Vehicle ID: {vid}, Position X: {pos:.1f}")
 
 
     def sample_CF_FF_mode(self):
@@ -538,6 +526,27 @@ class CarlaEnv(core.Env):
         idx = bisect.bisect_left(conf.speed_CDF, random_number)
         return conf.v_to_idx_dic.inverse[idx]
 
+    # --- helpers (ADD) ---
+    def _clamp_idx(self, idx, n):
+        return max(0, min(idx, n - 1))
+
+    def _clip_speed(self, v):
+        v_low = float(getattr(conf, "v_low", 0.0))
+        v_high = float(getattr(conf, "v_high", 60.0))
+        return float(max(v_low, min(v_high, v)))
+
+    def _discretize_speed_key(self, v):
+        v_low = float(getattr(conf, "v_low", 0.0))
+        v_high = float(getattr(conf, "v_high", 60.0))
+        k = int(round(max(v_low, min(v_high, float(v)))))
+        return k
+
+    def safe_av_bv_generation(self, cav_speed, cav_position, bv_speed, bv_position):
+        s_min = float(getattr(conf, "s_min", 15.0))
+        T = float(getattr(conf, "time_headway", 1.2))
+        required_bv_position = float(cav_position) + s_min + T * max(float(bv_speed), float(cav_speed))
+        return float(bv_speed), float(max(float(bv_position), required_bv_position))
+
     def setup_sensors(self):
         # Collision sensor
         if self.collision_sensor is None or not self.collision_sensor.is_alive:
@@ -560,10 +569,6 @@ class CarlaEnv(core.Env):
 
             self.camera_sensor = self.world.spawn_actor(camera_bp, camera_transform, attach_to=self.ego_vehicle)
             self.camera_sensor.listen(lambda image: self._process_camera_image(image))
-
-        self._tick()
-        self._tick()
-        self._camera_ready = True
 
 
     def destroy_sensors(self):
@@ -846,9 +851,6 @@ class CarlaEnv(core.Env):
         self.last_location = current_location
 
         self.world.tick()
-        if int(self.get_simulation_time() / self.step_size) % 10 == 0:
-            print(f"t = {self.get_simulation_time():.2f}s")
-
         self.episode_info["end_time"] = self.get_simulation_time()
         self.render_image()
 
@@ -1146,38 +1148,13 @@ class CarlaEnv(core.Env):
         except:
             return False
 
-    def _tick(self, timeout_seconds=None):
-        if self.world.get_settings().synchronous_mode:
-            if timeout_seconds is None:
-                return self.world.tick()
-            else:
-                return self.world.tick(timeout_seconds)
-        else:
-            if timeout_seconds is None:
-                return self.world.wait_for_tick()
-            else:
-                if timeout_seconds is None:
-                    return self.world.wait_for_tick()
-                else:
-                    return self.world.wait_for_tick(timeout_seconds)
-
 def get_adjusted_s(s, yaw, ref_yaw, threshold_deg=90):
     angle_diff = abs((yaw - ref_yaw + 180) % 360 - 180)
     return s if angle_diff < threshold_deg else -s
 
+
 def main():
-    env = CarlaEnv(num_veh=200, num_ped=0)
-    try:
-        for i in range(2000):
-            env.step()
-            if i % 20 == 0:
-                print(f"[loop] t={env.get_simulation_time():.2f}s, frame={i}")
-            stop, reason, _ = env.check_done()
-            if stop:
-                print("terminated:", reason)
-                break
-    except KeyboardInterrupt:
-        pass
+    env = CarlaEnv(num_veh=20, num_ped=10)
 
 
 if __name__=="__main__":

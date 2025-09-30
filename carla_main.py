@@ -28,7 +28,7 @@ else:
     raise ValueError(f"Unknown mode: {args.mode}")
 
 # === Create Carla environment ===
-env = CarlaEnv(num_veh=50, num_ped=10)
+env = CarlaEnv(num_veh=500, num_ped=10)
 env.worker_id = args.worker_id
 
 # === (Optional) Load D2RL agent ===
