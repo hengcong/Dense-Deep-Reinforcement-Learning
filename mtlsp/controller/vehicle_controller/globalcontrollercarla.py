@@ -11,12 +11,24 @@ class GlobalController(ABC):
     def controllable_veh_id_list(self):
         return self._get_controllable_veh_id_list()
 
+    @property
+    def controllable_ped_id_list(self):
+        return self._get_controllable_ped_id_list()
+
     def _get_controllable_veh_id_list(self):
         controllable_veh_id_list = []
         for veh_id, wrapper in self.env.vehicle_wrapper_list.items():
             if wrapper.role == self.veh_type:
                 controllable_veh_id_list.append(veh_id)
         return controllable_veh_id_list
+
+    def _get_controllable_ped_id_list(self):
+        controllable_ped_id_list = []
+        for ped_id, wrapper in self.env.pedestrian_wrapper_list.items():
+            if wrapper.role == self.veh_type:
+                controllable_ped_id_list.append(ped_id)
+        return controllable_ped_id_list
+
 
     @abstractmethod
     def step(self):
@@ -37,6 +49,11 @@ class DummyGlobalController(GlobalController):
                 vehicle = self.env.vehicle_wrapper_list[veh_id]
                 vehicle.reset_control_state()
 
+        elif self.veh_type == "Pedestrian":
+            for ped_id in self.controllable_veh_id_list:
+                ped = self.env.vehicle_wrapper_list[ped_id]
+                ped.reset_control_state()
+
     def step(self):
         if self.apply_control_permission():
             self.reset_control_and_action_state()
@@ -48,11 +65,12 @@ class DummyGlobalController(GlobalController):
                 vehicle.update(self.env)
 
                 cmds = []
-                if vehicle.cached_transform is not None:
-                    cmds.append(carla.command.ApplyTransform(vehicle.vehicle, vehicle.cached_transform))
-                if vehicle.cached_velocity is not None:
-                    cmds.append(carla.command.ApplyTargetVelocity(vehicle.vehicle, vehicle.cached_velocity))
-                self.env.client.apply_batch(cmds)
+                if vehicle.simulate_physics_enabled is False:
+                    if vehicle.cached_transform is not None:
+                        cmds.append(carla.command.ApplyTransform(vehicle.vehicle, vehicle.cached_transform))
+                    if vehicle.cached_velocity is not None:
+                        cmds.append(carla.command.ApplyTargetVelocity(vehicle.vehicle, vehicle.cached_velocity))
+                    self.env.client.apply_batch(cmds)
 
 
             elif self.veh_type == "BV":
@@ -60,6 +78,23 @@ class DummyGlobalController(GlobalController):
                     vehicle = self.env.vehicle_wrapper_list[veh_id]
                     vehicle.controller.step()
                     vehicle.update()
+
+            elif self.veh_type == "Pedestrian":
+                cmds = []
+                for ped_id in self.controllable_ped_id_list:
+
+                    pedestrian = self.env.pedestrian_wrapper_list[ped_id]
+                    ctrl = pedestrian.controller.step()
+
+                    # if isinstance(ctrl, carla.WalkerControl):
+                    #     d = ctrl.direction
+                        # print(
+                        #     f"[PED CTRL] id={ped_id} speed={ctrl.speed:.3f} dir=({d.x:.3f},{d.y:.3f},{d.z:.3f}) jump={ctrl.jump}")
+
+                    pedestrian.update(self.env)
+                    cmds.append(carla.command.ApplyWalkerControl(pedestrian.pedestrian, ctrl))
+                self.env.client.apply_batch(cmds)
+
 class PedestrianGlobalController(GlobalController):
     """Global controller for pedestrians (wrappers stored in env.pedestrian_wrapper_list).
        Assumes each wrapper.update(env, dt) performs manual integration and calls set_transform().

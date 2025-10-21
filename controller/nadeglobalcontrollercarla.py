@@ -60,14 +60,14 @@ class NADEBVGlobalController(NDDBVGlobalController):
                 #print(f"[DEBUG] vehicle.{vw.vehicle.id} cached_transform = {vw.cached_transform}")
                 # print(f"[DEBUG] vehicle.{vw.vehicle.id} cached_velocity = {vw.cached_velocity}")
 
-                if vw.cached_transform is not None:
-                    ctrl_cmd_batch.append(command.ApplyTransform(vw.vehicle, vw.cached_transform))
-
-                if vw.cached_velocity is not None:
-                    ctrl_cmd_batch.append(command.ApplyTargetVelocity(vw.vehicle, vw.cached_velocity))
+                if not getattr(vw, "simulate_physics_enabled", True):
+                    if vw.cached_transform is not None:
+                        ctrl_cmd_batch.append(command.ApplyTransform(vw.vehicle, vw.cached_transform))
+                    if vw.cached_velocity is not None:
+                        ctrl_cmd_batch.append(command.ApplyTargetVelocity(vw.vehicle, vw.cached_velocity))
 
             self.env.client.apply_batch(ctrl_cmd_batch)
-            self.env.world.tick()
+            #self.env.world.tick()
 
             # ego_obs = vw.observation.information.get("Ego", None)
                 # if ego_obs is None:

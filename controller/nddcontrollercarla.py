@@ -73,6 +73,7 @@ class NDDController(DiscreetController):
         if self.vehicle_wrapper.controlled_duration == 0:
             action_id = np.random.choice(len(conf.BV_ACTIONS), 1, replace=False, p=final_pdf).item()
             self.action = utils.action_id_to_action_command(action_id)
+
         return final_pdf
 
     @staticmethod

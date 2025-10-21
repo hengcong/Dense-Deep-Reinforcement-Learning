@@ -2,8 +2,6 @@ import carla
 import numpy as np
 import time
 import random
-
-from carla import TrafficManager
 from gym import spaces, core
 import sys
 import bisect
@@ -13,8 +11,10 @@ import pygame
 import os
 import json
 import copy
+from collections import defaultdict
 
 from mtlsp.observation.observation_carla import ObservationCarla
+from mtlsp.observation.pedestrian_observation_carla import PedestrianObservationCarla
 
 from conf.defaultconf import episode
 from mtlsp.controller.vehicle_controller.globalcontrollercarla import DummyGlobalController
@@ -23,12 +23,14 @@ from controller.nadeglobalcontrollercarla import NADEBVGlobalController
 from controller.trafficmanagercontroller import TMController
 from controller.treesearchnadecontrollercarla import TreeSearchNADEBackgroundController
 from controller.nadeglobalcontrollercarla import NADEBVGlobalController
-from mtlsp.controller.vehicle_controller.idmcontroller_carla import IDMController
+from mtlsp.controller.pedestrain_controller.ped_controller_SLSTM import PedestrianController
 from controller.nddcontrollercarla import NDDController
-#from controller.treesearchcarlacontroller import TreeSearchController
+from mtlsp.pedestrian.ped_obs_utils import Obs_Config, TrajStore
+
 
 from carla_infoextractor import CarlaInfoExtractor
 from envs.vehicle_wrapper import VehicleWrapper
+from mtlsp.pedestrian.pedestrian_wrapper import PedestrianWrapper
 from datetime import datetime
 
 from mtlsp.controller.vehicle_controller.idmcontroller_carla import IDMController
@@ -50,7 +52,7 @@ class CarlaEnv(core.Env):
 
         # Choose map robustly
         available_maps = self.client.get_available_maps()
-        target_key = 'Town04'
+        target_key = 'Town04'# 'singlelane400m'
         selected_map = None
         for m in available_maps:
             # m examples: '/Game/Carla/Maps/Town04', '/Game/Carla/Maps/singlelane400m'
@@ -65,6 +67,9 @@ class CarlaEnv(core.Env):
 
         self.world = self.client.load_world(selected_map)  # Load a specific town
         self.map = self.world.get_map()
+        spawn_points = self.map.get_spawn_points()
+        # print(f"[INFO] Spawn points: {spawn_points}")
+        self.blueprint_library = self.world.get_blueprint_library()
 
         # --- Enable synchronous mode and align timing ---
         settings = self.world.get_settings()
@@ -84,12 +89,33 @@ class CarlaEnv(core.Env):
         self.vehicles=[] # NOTE: remove later
         self.vehicle_wrapper_list = {}
         self.pedestrians = []
+        self.pedestrian_wrapper_list = {}
+        self.ped_ai_controller = []
+        self.ped_obs_config = Obs_Config()
+        self.ped_traj_store = TrajStore(self.ped_obs_config)
         if self.mode == "NDE":
             self.global_controller_instance_list = [
                 NADEBVGlobalController(env=self, veh_type="BV"),
-                DummyGlobalController(env=self, veh_type="CAV")
+                DummyGlobalController(env=self, veh_type="CAV"),
+                DummyGlobalController(env=self, veh_type="Pedestrian"),
             ]
-        self.blueprint_library = self.world.get_blueprint_library()
+        self.allowed_brands = [
+            "audi.tt",
+            "bmw.grandtourer",
+            "chevrolet.impala",
+            "citroen.c3",
+            "jeep.wrangler_rubicon",
+            "lincoln.mkz_2020",
+            "mini.cooper_s",
+            "nissan.micra",
+            "seat.leon",
+            "tesla.model3",
+            "toyota.prius",
+            "volkswagen.t2",
+            "mercedes.coupe"
+        ]
+
+        self.walker_bps = list(self.blueprint_library.filter("walker.pedestrian.*"))
 
         self.collision_sensor = None
         self.spectator = self.world.get_spectator()
@@ -107,10 +133,14 @@ class CarlaEnv(core.Env):
 
         self.spawn_ego_vehicle()
         self.generate_bv_traffic_flow()
-
+        self.spawn_pedestrians()
+        self.spawn_pedestrians()
+        self.world.tick()
+        print("walkers:", len(self.world.get_actors().filter('walker.pedestrian.*')))
         self.vehicle_map = self._group_vehicles_by_road_and_lane()
+        self.warmup(num_frames=20)
 
-        #self.spawn_pedestrians()
+
         self.experiment_path = "./carla_experiments"
         self.info_extractor = CarlaInfoExtractor(self)
         #self.constant, self.weight_reward, self.exposure, self.positive_weight_reward = 0, 0, 0, 0  # some customized metric logging
@@ -122,6 +152,7 @@ class CarlaEnv(core.Env):
         self.screen = None
 
         self.setup_sensors()
+        self.activate_agents()
         # log
         self.collision_happened = False
         self.episode_info = {"id": 0, "start_time": self.get_simulation_time(), "end_time": self.get_simulation_time()}
@@ -226,17 +257,54 @@ class CarlaEnv(core.Env):
         self.generate_bv_traffic_flow()
         self.spawn_pedestrians()
         self.setup_sensors()
+        self.activate_agents()
+        #self.warmup_physics(warm_ticks=8, target_speed_mps=15.0, tol_mps=0.5)
+        self.warmup(num_frames=20)
 
-    def spawn_ego_vehicle(self):
+    def spawn_ego_vehicle(self, max_retries=30):
         """Spawn an ego vehicle with autopilot or external controller."""
-        if self.ego_vehicle:
-            self.ego_vehicle.destroy()
+        if getattr(self, "ego_vehicle", None):
+            try:
+                if self.ego_vehicle.is_alive:
+                    self.ego_vehicle.destroy()
+            except Exception:
+                pass
+            finally:
+                self.ego_vehicle = None
+                self.ego_vehicle_wrapper = None
+            # tick after destroy in sync mode
+            try:
+                self.world.tick()
+            except Exception:
+                pass
 
         ego_bp = self.blueprint_library.filter('vehicle.tesla.model3')[0]
-        spawn_point = random.choice(self.map.get_spawn_points())
-        self.ego_vehicle = self.world.spawn_actor(ego_bp, spawn_point)
-        self.ego_vehicle_wrapper = VehicleWrapper(self.ego_vehicle)
-        self.ego_vehicle_wrapper.set_role("CAV")
+        spawn_points = list(self.map.get_spawn_points())
+        ego = None
+        for _ in range(max_retries):
+            sp = random.choice(spawn_points)
+            ego = self.world.try_spawn_actor(ego_bp, sp)
+            if ego:
+                break
+        if ego is None:
+            raise RuntimeError("[EGO] failed to spawn after retries; map likely saturated.")
+        self.world.tick()
+
+        wrapper = VehicleWrapper(ego)
+        wrapper.set_role("CAV")
+        wrapper.simulate_physics_enabled = True  # ego keeps physics ON
+        try:
+            tf = ego.get_transform()
+            v = ego.get_velocity()
+            wrapper.set_cached(tf, carla.Vector3D(v.x, v.y, v.z))
+        except Exception:
+            pass
+
+        self.ego_vehicle = ego
+        self.ego_vehicle_wrapper = wrapper
+
+        if hasattr(self, "vehicle_wrapper_list"):
+            self.vehicle_wrapper_list[ego.id] = wrapper
 
         if self.mode == "TM":
             self.traffic_manager.set_synchronous_mode(True)
@@ -249,15 +317,19 @@ class CarlaEnv(core.Env):
             self.ego_vehicle_wrapper.install_controller(self.ego_controller)
 
         elif self.mode == "NDE":
-            self.ego_vehicle_wrapper.cached_transform = spawn_point
+            self.ego_vehicle.set_autopilot(False)
+            #self.ego_vehicle_wrapper.simulate_physics_enabled = False
+
+            #self.ego_vehicle_wrapper.cached_transform = spawn_point
             speed = 15.0  # m/s
             yaw = self.ego_vehicle_wrapper.cached_transform.rotation.yaw
             yaw_rad = math.radians(yaw)
-
             vx = speed * math.cos(yaw_rad)
             vy = speed * math.sin(yaw_rad)
+            #print(f"[DEBUG] ego vehicle yaw_rad: {yaw_rad}, vx: {vx}, vy: {vy}")
 
-            self.ego_vehicle_wrapper.cached_velocity = carla.Vector3D(x=vx, y=vy, z=0.0)
+            self.ego_vehicle_wrapper.cached_velocity = carla.Vector3D(x=vx, y=vy, z=10.0)
+            #print(f"cached velocity: {self.ego_vehicle_wrapper.cached_velocity}")
 
             self.ego_vehicle.set_autopilot(False)
             controller = IDMController(env=self)
@@ -284,27 +356,28 @@ class CarlaEnv(core.Env):
 
     def spawn_background_vehicle(self, spawn_point, speed, road_id, lane_id):
         """ Generate background vehicles in CARLA"""
-        allowed_brands = [
-            "audi.tt",
-            "bmw.grandtourer",
-            "chevrolet.impala",
-            "citroen.c3",
-            "jeep.wrangler_rubicon",
-            "lincoln.mkz_2020",
-            "mini.cooper_s",
-            "nissan.micra",
-            "seat.leon",
-            "tesla.model3",
-            "toyota.prius",
-            "volkswagen.t2",
-            "mercedes.coupe"
-        ]
 
-        vehicle_blueprints = [
-            self.blueprint_library.find(f"vehicle.{brand}") for brand in allowed_brands
-        ]
-        vehicle_bp = random.choice(vehicle_blueprints)
-        vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+        brand = random.choice(self.allowed_brands)
+        bp = self.blueprint_library.find(f"vehicle.{brand}")
+
+        if bp is None:
+            # fallback: try others in the whitelist
+            for b in self.allowed_brands:
+                candidate = self.blueprint_library.find(f"vehicle.{b}")
+                if candidate is not None:
+                    bp = candidate
+                    break
+
+        if bp is None:
+            return None  # no valid blueprint available
+
+        # optional per-spawn attributes
+        if bp.has_attribute("color"):
+            colors = bp.get_attribute("color").recommended_values
+            if colors:
+                bp.set_attribute("color", random.choice(colors))
+
+        vehicle = self.world.try_spawn_actor(bp, spawn_point)
 
         if vehicle:
             wrapper = VehicleWrapper(vehicle)
@@ -342,30 +415,30 @@ class CarlaEnv(core.Env):
                     self.traffic_manager.auto_lane_change(vehicle, False)
                 """
             elif self.mode == "NDE":
-                wrapper.vehicle.set_autopilot(False)
-                wrapper.vehicle.set_simulate_physics(False)
                 wrapper.simulate_physics_enabled = False
+
                 controller = TreeSearchNADEBackgroundController(env=self)
-                controller.attach_to_vehicle(wrapper)
                 wrapper.install_controller(controller)
-                transform = vehicle.get_transform()
-                forward_vector = transform.get_forward_vector()
-                velocity_vector = carla.Vector3D(
-                    x=forward_vector.x * speed,
-                    y=forward_vector.y * speed,
-                    z=forward_vector.z * speed
-                )
-                wrapper.cached_transform = transform
-                wrapper.cached_velocity = velocity_vector
+
+                #print(f"[✓] Vehicle {vehicle.id} spawned | mode={self.mode} | physics={wrapper.simulate_physics_enabled}")
+                # if wrapper.controller:
+                #     print(f"[✓] Controller attached to vehicle {vehicle.id}")
+
+
+                # transform = vehicle.get_transform()
+                # forward_vector = transform.get_forward_vector()
+                # velocity_vector = carla.Vector3D(
+                #     x=forward_vector.x * speed,
+                #     y=forward_vector.y * speed,
+                #     z=forward_vector.z * speed
+                # )
+                #
+                # wrapper.cached_transform = transform
+                wrapper.cached_velocity = speed
                 # print(f"vehicle.{vehicle.id} speed:{speed}")
                 # print(f"vehicle.{vehicle.id} direction:{forward_vector}, speed:{velocity_vector}")
 
-                self._tick()
-
                 #print(f"[✓] Vehicle {vehicle.id} spawned | mode={self.mode} | physics={wrapper.simulate_physics_enabled}")
-
-                #wrapper.update_observation(self)
-
                 # if wrapper.controller:
                 #     print(f"[✓] Controller attached to vehicle {vehicle.id}")
                 # else:
@@ -387,75 +460,190 @@ class CarlaEnv(core.Env):
             # if controller is not None:
             #     self.global_controller_instance_list[vehicle.id] = controller
             return wrapper
-
         return None
 
     def spawn_pedestrians(self):
         """Spawns pedestrians in the CARLA environment and assigns AI controllers."""
 
-        # Remove existing pedestrians before spawning new ones
-        for pedestrian in self.pedestrians:
-            if pedestrian.is_alive:
-                pedestrian.destroy()
+        # cleanup
+        if not hasattr(self, "ped_controllers"):
+            self.ped_controllers = []
+        for c in list(self.ped_controllers):
+            try:
+                c.stop()
+            except:
+                pass
+            try:
+                c.destroy()
+            except:
+                pass
+        self.ped_controllers = []
+
+        for w in list(getattr(self, "pedestrians", [])):
+            try:
+                w.destroy()
+            except:
+                pass
         self.pedestrians = []
 
-        # Get the pedestrian blueprint
-        pedestrian_bp = random.choice(self.blueprint_library.filter("walker.pedestrian.*"))
-        controller_bp = self.blueprint_library.find("controller.ai.walker")
+        if getattr(self, "num_ped", 0) <= 0:
+            print("[PED] num_ped <= 0, skip spawn")
+            return 0
 
-        # Retrieve spawn points for pedestrians
+        world = self.world
+        blib = self.blueprint_library
+
+        before = len(world.get_actors().filter("walker.pedestrian.*"))
+
+        walker_bps = blib.filter("walker.pedestrian.*")
+        if not walker_bps:
+            print("[PED][ERR] No walker blueprints found.")
+            return 0
+        controller_bp = blib.find("controller.ai.walker")
+
         spawn_points = []
         for _ in range(self.num_ped):
-            spawn_point = carla.Transform()
-            spawn_point.location = self.world.get_random_location_from_navigation()
-            if spawn_point.location:
-                spawn_points.append(spawn_point)
+            loc = world.get_random_location_from_navigation()
+            if loc is not None:
+                tf = carla.Transform(loc, carla.Rotation(yaw=random.uniform(-180, 180)))
+                spawn_points.append(tf)
 
-        # Spawn pedestrians
+        spawned_ids = []
         for spawn_point in spawn_points:
-            pedestrian = self.world.try_spawn_actor(pedestrian_bp, spawn_point)
-            if pedestrian:
-                self.pedestrians.append(pedestrian)
+            pedestrian_bp = random.choice(walker_bps)
+            # optional tag to recognize them later in the UI
+            if pedestrian_bp.has_attribute("role_name"):
+                pedestrian_bp.set_attribute("role_name", "ped_autospawn")
 
-                # Assign AI controller to the pedestrian
-                controller = self.world.spawn_actor(controller_bp, carla.Transform(), attach_to=pedestrian)
-                if controller:
-                    # Start AI-controlled movement
-                    controller.start()
-                    controller.go_to_location(self.world.get_random_location_from_navigation())
-                    controller.set_max_speed(random.uniform(0.5, 1.5))  # Set random walking speed
+            pedestrian = world.try_spawn_actor(pedestrian_bp, spawn_point)
+            if pedestrian:
+                ped_wrapper = PedestrianWrapper(pedestrian, self)
+                ped_wrapper.set_role("Pedestrian")
+                self.pedestrians.append(ped_wrapper)
+                self.pedestrian_wrapper_list[pedestrian.id]= ped_wrapper
+                spawned_ids.append(pedestrian.id)
+                controller = PedestrianController(observation_method=PedestrianObservationCarla)
+                ped_wrapper.install_controller(controller)
+                # visual marker for quick verification
+                try:
+                    world.debug.draw_string(
+                        spawn_point.location,
+                        f"PED {pedestrian.id}",
+                        life_time=5.0
+                    )
+                except:
+                    pass
+
+                # controller (kept commented as in your version)
+                # controller = world.spawn_actor(controller_bp, carla.Transform(), attach_to=pedestrian)
+                # if controller:
+                #     self.ped_controllers.append(controller)
+                #     controller.start()
+                #     controller.go_to_location(world.get_random_location_from_navigation())
+                #     controller.set_max_speed(random.uniform(0.5, 1.5))
+
+        after = len(world.get_actors().filter("walker.pedestrian.*"))
+        delta = after - before
+
+        print(
+            f"[PED][SUMMARY] requested={self.num_ped} spawned={len(spawned_ids)} total_before={before} total_after={after} delta={delta}")
+        if spawned_ids:
+            print(f"[PED][IDS] {spawned_ids}")
+
+        # optional: store for later checks
+        self.last_ped_spawn_count = len(spawned_ids)
+        self.last_ped_spawn_ids = spawned_ids
+
+        return len(spawned_ids)
+    # def spawn_pedestrian(self):
+    #
+    #
+    def activate_agents(self, warm_ticks: int = 5):
+        """Activates agents after all agents have been spawned and all controllers have been reset."""
+        dt = self.world.get_settings().fixed_delta_seconds or 0.05
+        for w in self.vehicle_wrapper_list.values():
+            v = w.vehicle
+            v.set_autopilot(False)
+
+            if getattr(w, "simulate_physics_enabled", True):
+                if hasattr(v, "set_simulate_physics"):
+                    v.set_simulate_physics(True)
+                try: v.disable_constant_velocity()
+                except Exception: pass
+
+            else:
+                if hasattr(v, "set_simulate_physics"):
+                    v.set_simulate_physics(False)
+                # w.cached_transform = v.get_transform()
+                # w.cached_velocity = v.get_velocity()
+                transform = v.get_transform()
+                forward_vector = transform.get_forward_vector()
+                velocity_vector = carla.Vector3D(
+                    x=forward_vector.x * w.cached_velocity,
+                    y=forward_vector.y * w.cached_velocity,
+                    z=forward_vector.z * w.cached_velocity
+                )
+                loc_vector = carla.Location(
+                    x=transform.location.x + forward_vector.x * w.cached_velocity* dt,
+                    y=transform.location.y + forward_vector.y * w.cached_velocity* dt,
+                    z=transform.location.z + forward_vector.z * w.cached_velocity*dt
+                )
+                new_tf = carla.Transform(loc_vector, transform.rotation)
+                w.cached_transform = new_tf
+                w.cached_velocity = velocity_vector
+
+        # for ped in self.pedestrian_wrapper_list.values():
+        #     pass
+
+        for _ in range(max(0, int(warm_ticks))):
+            self.world.tick()
+
+    def warmup(self, num_frames=20):
+
+        for wrapper in self.pedestrian_wrapper_list.values():
+            ped = wrapper.pedestrian
+            ai_ctrl = self.world.spawn_actor(self.world.get_blueprint_library().find("controller.ai.walker"), carla.Transform(), attach_to=ped)
+            ai_ctrl.start()
+            ai_ctrl.go_to_location(self.world.get_random_location_from_navigation())
+            ai_ctrl.set_max_speed(1.4)
+            self.ped_ai_controller.append(ai_ctrl)
+
+        for _ in range(num_frames):
+            self.world.tick()
+            self.ped_traj_store.scan_if_needed(self)
+            for wrapper in self.pedestrian_wrapper_list.values():
+                wrapper.update_observation(self)
+
+        for ai_ctrl in self.ped_ai_controller:
+            try:
+                ai_ctrl.stop()
+                ai_ctrl.destroy()
+            except:
+                pass
+        self.ped_ai_controller = []
+
 
     def generate_bv_traffic_flow(self):
         all_spawn_lanes = [(key, sps) for key, sps in self.lane_map.items() if len(sps) > 1]
-        if not all_spawn_lanes:
-            print("[BV][WARN] lane_map has no lanes with >1 spawn points.")
         random.shuffle(all_spawn_lanes)
 
         total_needed = self.num_veh
         spawned = 0
         vehicle_records = []
-        ctrl_cmd_batch = []
+        #ctrl_cmd_batch = []
         used_positions = set()
-        tm_port = self.traffic_manager.get_port()        # >>> TM port (hand over immediately after spawn)
 
         for (road_id, lane_id), spawn_points in all_spawn_lanes:
             if spawned >= total_needed:
                 break
 
-            spawn_points = sorted(spawn_points, key=lambda sp: sp.location.x)
+            #spawn_points = sorted(spawn_points, key=lambda sp: sp.location.x)
             max_in_lane = min(len(spawn_points), total_needed - spawned)
             previous = None
 
             for i in range(max_in_lane):
-                if spawned >= total_needed:
-                    break
-
                 sp = spawn_points[i]
                 pos = round(sp.location.x, 1)
-                # >>> use (x,y) for uniqueness
-                pos_key = (round(sp.location.x, 1), round(sp.location.y, 1))
-                if pos_key in used_positions:
-                    continue
 
                 if pos in used_positions:
                     continue
@@ -473,13 +661,13 @@ class CarlaEnv(core.Env):
 
                 wrapper = self.spawn_background_vehicle(sp, speed, road_id, lane_id)
 
-                if wrapper:
-                    if wrapper.cached_transform is not None:
-                        ctrl_cmd_batch.append(carla.command.ApplyTransform(wrapper.vehicle, wrapper.cached_transform))
-
-                    if wrapper.cached_velocity is not None:
-                        ctrl_cmd_batch.append(
-                            carla.command.ApplyTargetVelocity(wrapper.vehicle, wrapper.cached_velocity))
+                # if wrapper:
+                #     if wrapper.cached_transform is not None:
+                #         ctrl_cmd_batch.append(carla.command.ApplyTransform(wrapper.vehicle, wrapper.cached_transform))
+                #
+                #     if wrapper.cached_velocity is not None:
+                #         ctrl_cmd_batch.append(
+                #             carla.command.ApplyTargetVelocity(wrapper.vehicle, wrapper.cached_velocity))
                         # speed_val = np.sqrt(wrapper.cached_velocity.x ** 2 + wrapper.cached_velocity.y ** 2)
                         # print(f"[✓ SPAWNED] vehicle.{wrapper.vehicle.id} speed: {speed_val:.2f} m/s")
 
@@ -492,8 +680,9 @@ class CarlaEnv(core.Env):
 
                 if spawned >= total_needed:
                     break
-        self.client.apply_batch(ctrl_cmd_batch)
-        self._tick()
+        #self.client.apply_batch(ctrl_cmd_batch)
+        #self.world.tick()
+
 
         print("=== Background Vehicles ===")
         for vid, pos, mode in vehicle_records:
@@ -540,11 +729,11 @@ class CarlaEnv(core.Env):
 
     def setup_sensors(self):
         # Collision sensor
-        if self.collision_sensor is None or not self.collision_sensor.is_alive:
-            sensor_bp = self.blueprint_library.find('sensor.other.collision')
-            sensor_transform = carla.Transform(carla.Location(x=0, y=0, z=2))
-            self.collision_sensor = self.world.spawn_actor(sensor_bp, sensor_transform, attach_to=self.ego_vehicle)
-            self.collision_sensor.listen(lambda event: self._on_collision(event))
+        # if self.collision_sensor is None or not self.collision_sensor.is_alive:
+        #     sensor_bp = self.blueprint_library.find('sensor.other.collision')
+        #     sensor_transform = carla.Transform(carla.Location(x=0, y=0, z=2))
+        #     self.collision_sensor = self.world.spawn_actor(sensor_bp, sensor_transform, attach_to=self.ego_vehicle)
+        #     self.collision_sensor.listen(lambda event: self._on_collision(event))
 
         # RGB camera sensor
         if self.camera_sensor is None or not self.camera_sensor.is_alive:
@@ -617,10 +806,9 @@ class CarlaEnv(core.Env):
         fps_text = self.font.render(f"FPS: {self._fps:.2f}", True, (255, 255, 0))
         self.screen.blit(fps_text, (10, 10))
 
-        # === Abstract bird's-eye map ===
         try:
             mini_map_size = 200
-            scale = 1.0  # pixels per meter
+            scale = 1.0
             padding = 10
             center = (mini_map_size // 2, mini_map_size // 2)
 
@@ -629,7 +817,7 @@ class CarlaEnv(core.Env):
 
             ego_loc = self.ego_vehicle.get_location()
 
-            # Draw simplified lane graph using walkable waypoints
+            # Lanes
             for waypoint in self.map.generate_waypoints(2.0):
                 next_wp_list = waypoint.next(2.0)
                 if not next_wp_list:
@@ -643,7 +831,7 @@ class CarlaEnv(core.Env):
 
                 pygame.draw.line(mini_surface, (90, 90, 90), (x1, y1), (x2, y2), 1)
 
-            # Draw vehicles
+            # Vehicles
             for vehicle in [self.ego_vehicle] + self.vehicles:
                 loc = vehicle.get_location()
                 dx = (loc.x - ego_loc.x) * scale
@@ -653,7 +841,17 @@ class CarlaEnv(core.Env):
                 color = (0, 255, 0) if vehicle.id == self.ego_vehicle.id else (200, 200, 200)
                 pygame.draw.circle(mini_surface, color, (vx, vy), 4)
 
-            # Draw traffic lights
+            # Pedestrians
+            for ped_item in getattr(self, "pedestrians", []):
+                actor = getattr(ped_item, "actor", getattr(ped_item, "pedestrian", ped_item))
+                loc = actor.get_location()
+                dx = (loc.x - ego_loc.x) * scale
+                dy = (loc.y - ego_loc.y) * scale
+                px = int(center[0] - dx)
+                py = int(center[1] - dy)
+                pygame.draw.circle(mini_surface, (50, 150, 255), (px, py), 2)
+
+            # Traffic lights
             for tl in self.world.get_actors().filter("traffic.traffic_light*"):
                 loc = tl.get_location()
                 dx = (loc.x - ego_loc.x) * scale
@@ -668,13 +866,11 @@ class CarlaEnv(core.Env):
                 }.get(tl.state, (50, 50, 50))
                 pygame.draw.circle(mini_surface, color, (tx, ty), 3)
 
-            # Border
             pygame.draw.rect(mini_surface, (200, 200, 0), (0, 0, mini_map_size, mini_map_size), 2)
 
-            # Blit to bottom-right
             self.screen.blit(mini_surface, (
-                self.latest_image.shape[1] - mini_map_size - padding,
-                self.latest_image.shape[0] - mini_map_size - padding
+                self.latest_image.shape[1] - mini_map_size - 10,
+                self.latest_image.shape[0] - mini_map_size - 10
             ))
 
         except Exception as e:
@@ -686,6 +882,102 @@ class CarlaEnv(core.Env):
             if event.type == pygame.QUIT:
                 pygame.quit()
                 exit()
+
+    # def render_image(self):
+    #     if self.latest_image is None:
+    #         return
+    #
+    #     if not self.pygame_display_initialized:
+    #         pygame.init()
+    #         pygame.font.init()
+    #         self.font = pygame.font.SysFont("Arial", 24)
+    #         self.screen = pygame.display.set_mode((self.latest_image.shape[1], self.latest_image.shape[0]))
+    #         pygame.display.set_caption("Ego Camera View")
+    #         self.pygame_display_initialized = True
+    #         self._last_time = time.time()
+    #         self._fps = 0.0
+    #
+    #     current_time = time.time()
+    #     dt = current_time - self._last_time
+    #     if dt > 0:
+    #         self._fps = 1.0 / dt
+    #     self._last_time = current_time
+    #
+    #     surface = pygame.surfarray.make_surface(self.latest_image.swapaxes(0, 1))
+    #     self.screen.blit(surface, (0, 0))
+    #
+    #     fps_text = self.font.render(f"FPS: {self._fps:.2f}", True, (255, 255, 0))
+    #     self.screen.blit(fps_text, (10, 10))
+    #
+    #     # === Abstract bird's-eye map ===
+    #     try:
+    #         mini_map_size = 200
+    #         scale = 1.0  # pixels per meter
+    #         padding = 10
+    #         center = (mini_map_size // 2, mini_map_size // 2)
+    #
+    #         mini_surface = pygame.Surface((mini_map_size, mini_map_size))
+    #         mini_surface.fill((40, 40, 40))
+    #
+    #         ego_loc = self.ego_vehicle.get_location()
+    #
+    #         # Draw simplified lane graph using walkable waypoints
+    #         for waypoint in self.map.generate_waypoints(2.0):
+    #             next_wp_list = waypoint.next(2.0)
+    #             if not next_wp_list:
+    #                 continue
+    #             next_wp = next_wp_list[0]
+    #
+    #             x1 = int(center[0] - (waypoint.transform.location.x - ego_loc.x) * scale)
+    #             y1 = int(center[1] - (waypoint.transform.location.y - ego_loc.y) * scale)
+    #             x2 = int(center[0] - (next_wp.transform.location.x - ego_loc.x) * scale)
+    #             y2 = int(center[1] - (next_wp.transform.location.y - ego_loc.y) * scale)
+    #
+    #             pygame.draw.line(mini_surface, (90, 90, 90), (x1, y1), (x2, y2), 1)
+    #
+    #         # Draw vehicles
+    #         for vehicle in [self.ego_vehicle] + self.vehicles:
+    #             loc = vehicle.get_location()
+    #             dx = (loc.x - ego_loc.x) * scale
+    #             dy = (loc.y - ego_loc.y) * scale
+    #             vx = int(center[0] - dx)
+    #             vy = int(center[1] - dy)
+    #             color = (0, 255, 0) if vehicle.id == self.ego_vehicle.id else (200, 200, 200)
+    #             pygame.draw.circle(mini_surface, color, (vx, vy), 4)
+    #
+    #         # Draw traffic lights
+    #         for tl in self.world.get_actors().filter("traffic.traffic_light*"):
+    #             loc = tl.get_location()
+    #             dx = (loc.x - ego_loc.x) * scale
+    #             dy = (loc.y - ego_loc.y) * scale
+    #             tx = int(center[0] - dx)
+    #             ty = int(center[1] - dy)
+    #             color = {
+    #                 carla.TrafficLightState.Red: (255, 0, 0),
+    #                 carla.TrafficLightState.Yellow: (255, 255, 0),
+    #                 carla.TrafficLightState.Green: (0, 255, 0),
+    #                 carla.TrafficLightState.Off: (100, 100, 100)
+    #             }.get(tl.state, (50, 50, 50))
+    #             pygame.draw.circle(mini_surface, color, (tx, ty), 3)
+    #
+    #         # Border
+    #         pygame.draw.rect(mini_surface, (200, 200, 0), (0, 0, mini_map_size, mini_map_size), 2)
+    #
+    #         # Blit to bottom-right
+    #         self.screen.blit(mini_surface, (
+    #             self.latest_image.shape[1] - mini_map_size - padding,
+    #             self.latest_image.shape[0] - mini_map_size - padding
+    #         ))
+    #
+    #     except Exception as e:
+    #         print(f"[⚠️ Abstract mini-map failed] {e}")
+    #
+    #     pygame.display.update()
+    #
+    #     for event in pygame.event.get():
+    #         if event.type == pygame.QUIT:
+    #             pygame.quit()
+    #             exit()
 
     def _process_camera_image(self, image):
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
@@ -825,8 +1117,12 @@ class CarlaEnv(core.Env):
     def step(self):
 
         for wrapper in self.vehicle_wrapper_list.values():
-            wrapper.update_observation(self)
+            wrapper.update_observation(env=self)
         self.ego_vehicle_wrapper.update_observation(self)
+
+        self.ped_traj_store.scan_if_needed(self)
+        for wrapper in self.pedestrian_wrapper_list.values():
+            wrapper.update_observation(env=self)
 
         self.vehicle_map = self._group_vehicles_by_road_and_lane()
         self.step_data = {}
@@ -844,16 +1140,14 @@ class CarlaEnv(core.Env):
             step_distance = self.get_distance(self.last_location, current_location)
             self.distance_travelled += step_distance
         self.last_location = current_location
-
+        v = self.ego_vehicle.get_velocity()
+        #print("EGO SPD PRE-TICK", (v.x ** 2 + v.y ** 2 + v.z ** 2) ** 0.5)
         self.world.tick()
-        if int(self.get_simulation_time() / self.step_size) % 10 == 0:
-            print(f"t = {self.get_simulation_time():.2f}s")
 
         self.episode_info["end_time"] = self.get_simulation_time()
         self.render_image()
 
         self.info_extractor.get_snapshot_info(control_info_list)
-
 
     def compute_reward(self):
         reward = 0.0
@@ -1006,7 +1300,7 @@ class CarlaEnv(core.Env):
 
     # TODO: Due to CARLA's built-in physics, direct lateral speed constraints are unnecessary.
     def set_vehicle_max_lateralspeed(self, vehicle, max_steer=0.3):
-        
+
         control = vehicle.get_control()
         control.steer = max(-max_steer, min(max_steer, control.steer))
         vehicle.apply_control(control)
@@ -1154,24 +1448,57 @@ class CarlaEnv(core.Env):
                 return self.world.tick(timeout_seconds)
         else:
             if timeout_seconds is None:
-                return self.world.wait_for_tick()
+                return self.world.tick()
             else:
                 if timeout_seconds is None:
-                    return self.world.wait_for_tick()
+                    return self.world.tick()
                 else:
-                    return self.world.wait_for_tick(timeout_seconds)
+                    return self.world.tick()
+
+    def draw_random_spawn_points(self, world, n=50, step=4.0, min_clear_dist=8.0, z_lift=0.5, lifetime=20.0):
+        """Draw random potential vehicle spawn points directly on the CARLA map."""
+        m = world.get_map()
+        dbg = world.debug
+
+        # Get dense drivable waypoints
+        wps = [w for w in m.generate_waypoints(step) if w.lane_type == carla.LaneType.Driving]
+        random.shuffle(wps)
+
+        vehicles = world.get_actors().filter('vehicle.*')
+        chosen = []
+
+        for w in wps:
+            loc = w.transform.location + carla.Location(z=z_lift)
+            ok = True
+            for v in vehicles:
+                if v.get_location().distance(loc) < min_clear_dist:
+                    ok = False
+                    break
+            if ok:
+                chosen.append(loc)
+                if len(chosen) >= n:
+                    break
+
+        # Draw chosen points (green dots)
+        for loc in chosen:
+            dbg.draw_point(loc, size=0.15, color=carla.Color(0, 255, 0), life_time=lifetime)
+
+        print(f"Drawn {len(chosen)} random spawn points on the map.")
+
 
 def get_adjusted_s(s, yaw, ref_yaw, threshold_deg=90):
     angle_diff = abs((yaw - ref_yaw + 180) % 360 - 180)
     return s if angle_diff < threshold_deg else -s
 
 def main():
-    env = CarlaEnv(num_veh=200, num_ped=0)
+    env = CarlaEnv(num_veh=50, num_ped=20)
+    # env.draw_random_spawn_points(env.world, n = 50)
+
     try:
         for i in range(2000):
             env.step()
-            if i % 20 == 0:
-                print(f"[loop] t={env.get_simulation_time():.2f}s, frame={i}")
+            # if i % 20 == 0:
+            #     print(f"[loop] t={env.get_simulation_time():.2f}s, frame={i}")
             stop, reason, _ = env.check_done()
             if stop:
                 print("terminated:", reason)
